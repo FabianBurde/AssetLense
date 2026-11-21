@@ -8,7 +8,7 @@ public sealed class AssetRepository
 {
     private const string Columns =
         "id, root_id, relative_path, file_name, extension, asset_type, size_bytes, " +
-        "content_hash, width, height, modified_utc, added_utc, is_missing, directory";
+        "content_hash, width, height, modified_utc, added_utc, is_missing, directory, is_favorite, is_own";
 
     private readonly AssetDatabase _db;
 
@@ -344,6 +344,346 @@ public sealed class AssetRepository
         cmd.Parameters.AddWithValue("$snake", t.SnakeCaseNames ? 1 : 0);
     }
 
+    // ------------------------------------------------------------ favorites / own
+
+    public Task SetFavoriteAsync(IReadOnlyList<long> ids, bool value, CancellationToken ct = default) =>
+        SetFlagAsync("is_favorite", ids, value, ct);
+
+    public Task SetOwnAsync(IReadOnlyList<long> ids, bool value, CancellationToken ct = default) =>
+        SetFlagAsync("is_own", ids, value, ct);
+
+    private async Task SetFlagAsync(string column, IReadOnlyList<long> ids, bool value, CancellationToken ct)
+    {
+        if (ids.Count == 0) return;
+
+        await using var conn = await _db.OpenAsync(ct);
+        await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = $"UPDATE assets SET {column} = $v WHERE id = $id;"; // column is an internal constant
+        cmd.Parameters.AddWithValue("$v", value ? 1 : 0);
+        var pId = cmd.Parameters.Add("$id", SqliteType.Integer);
+
+        foreach (var id in ids)
+        {
+            pId.Value = id;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        await tx.CommitAsync(ct);
+    }
+
+    /// <summary>Marks (or unmarks) every present file in a folder and its subfolders as the user's own work.</summary>
+    public async Task<int> SetOwnForFolderAsync(long rootId, string folder, bool value, CancellationToken ct = default)
+    {
+        var f = folder.Trim('/');
+
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = f.Length == 0
+            ? "UPDATE assets SET is_own = $v WHERE root_id = $root AND is_missing = 0;"
+            : "UPDATE assets SET is_own = $v WHERE root_id = $root AND is_missing = 0 " +
+              "AND (directory = $folder OR directory LIKE $like ESCAPE '\\');";
+        cmd.Parameters.AddWithValue("$v", value ? 1 : 0);
+        cmd.Parameters.AddWithValue("$root", rootId);
+        if (f.Length > 0)
+        {
+            cmd.Parameters.AddWithValue("$folder", f);
+            cmd.Parameters.AddWithValue("$like", EscapeLike(f) + "/%");
+        }
+        return await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task<LibraryCounts> GetFilterCountsAsync(CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT
+              (SELECT COUNT(*) FROM assets WHERE is_favorite = 1 AND is_missing = 0),
+              (SELECT COUNT(*) FROM assets WHERE is_own = 1 AND is_missing = 0),
+              (SELECT COUNT(DISTINCT xt.asset_id) FROM asset_tags xt
+                 JOIN assets a ON a.id = xt.asset_id WHERE a.is_missing = 0);
+            """;
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        await r.ReadAsync(ct);
+        return new LibraryCounts(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2));
+    }
+
+    // ------------------------------------------------------------ tags
+
+    public async Task<IReadOnlyList<TagInfo>> GetTagsAsync(CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT t.id, t.name, COUNT(a.id)
+            FROM tags t
+            LEFT JOIN asset_tags atg ON atg.tag_id = t.id
+            LEFT JOIN assets a ON a.id = atg.asset_id AND a.is_missing = 0
+            GROUP BY t.id, t.name
+            ORDER BY t.name COLLATE NOCASE;
+            """;
+
+        var list = new List<TagInfo>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+            list.Add(new TagInfo(r.GetInt64(0), r.GetString(1), r.GetInt32(2)));
+        return list;
+    }
+
+    /// <summary>The tags on the given assets, with how many of those assets carry each one.</summary>
+    public async Task<IReadOnlyList<TagCount>> GetTagsForAssetsAsync(IReadOnlyList<long> ids, CancellationToken ct = default)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (ids.Count == 0) return Array.Empty<TagCount>();
+
+        await using var conn = await _db.OpenAsync(ct);
+        foreach (var chunk in ids.Chunk(500)) // stay well below SQLite's parameter limit
+        {
+            await using var cmd = conn.CreateCommand();
+            var names = new string[chunk.Length];
+            for (var i = 0; i < chunk.Length; i++)
+            {
+                names[i] = "$p" + i;
+                cmd.Parameters.AddWithValue(names[i], chunk[i]);
+            }
+            cmd.CommandText =
+                "SELECT t.name, COUNT(*) FROM asset_tags xt JOIN tags t ON t.id = xt.tag_id " +
+                $"WHERE xt.asset_id IN ({string.Join(",", names)}) GROUP BY t.id, t.name;";
+
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                var name = r.GetString(0);
+                counts[name] = counts.GetValueOrDefault(name) + r.GetInt32(1);
+            }
+        }
+
+        return counts
+            .Select(kv => new TagCount(kv.Key, kv.Value))
+            .OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    public async Task AddTagsAsync(IReadOnlyList<long> ids, IEnumerable<string> names, CancellationToken ct = default)
+    {
+        var clean = names.Select(TagNames.Normalize).Where(n => n.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (clean.Count == 0 || ids.Count == 0) return;
+
+        await using var conn = await _db.OpenAsync(ct);
+        await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+
+        var tagIds = new List<long>();
+        foreach (var name in clean)
+        {
+            await using (var insert = conn.CreateCommand())
+            {
+                insert.Transaction = tx;
+                insert.CommandText = "INSERT OR IGNORE INTO tags (name) VALUES ($name);";
+                insert.Parameters.AddWithValue("$name", name);
+                await insert.ExecuteNonQueryAsync(ct);
+            }
+
+            await using var select = conn.CreateCommand();
+            select.Transaction = tx;
+            select.CommandText = "SELECT id FROM tags WHERE name = $name;";
+            select.Parameters.AddWithValue("$name", name);
+            tagIds.Add(Convert.ToInt64(await select.ExecuteScalarAsync(ct)));
+        }
+
+        await using var link = conn.CreateCommand();
+        link.Transaction = tx;
+        link.CommandText = "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES ($a, $t);";
+        var pA = link.Parameters.Add("$a", SqliteType.Integer);
+        var pT = link.Parameters.Add("$t", SqliteType.Integer);
+        foreach (var tagId in tagIds)
+        {
+            pT.Value = tagId;
+            foreach (var id in ids)
+            {
+                pA.Value = id;
+                await link.ExecuteNonQueryAsync(ct);
+            }
+        }
+
+        await tx.CommitAsync(ct);
+    }
+
+    public async Task RemoveTagAsync(IReadOnlyList<long> ids, string name, CancellationToken ct = default)
+    {
+        if (ids.Count == 0) return;
+
+        await using var conn = await _db.OpenAsync(ct);
+        await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "DELETE FROM asset_tags WHERE asset_id = $a AND tag_id = (SELECT id FROM tags WHERE name = $name);";
+        cmd.Parameters.AddWithValue("$name", name);
+        var pA = cmd.Parameters.Add("$a", SqliteType.Integer);
+        foreach (var id in ids)
+        {
+            pA.Value = id;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        await tx.CommitAsync(ct);
+    }
+
+    /// <summary>Deletes the tag itself and removes it from every asset.</summary>
+    public async Task DeleteTagAsync(long tagId, CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM tags WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", tagId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    // ------------------------------------------------------------ license / readme documents
+
+    /// <summary>Indexed files in a root whose names look like license or readme files.</summary>
+    public async Task<IReadOnlyList<DocCandidate>> GetDocumentCandidatesAsync(long rootId, CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT directory, relative_path, file_name FROM assets
+            WHERE root_id = $root AND is_missing = 0 AND (
+                   file_name LIKE 'license%' OR file_name LIKE 'licence%' OR file_name LIKE 'copying%'
+                OR file_name LIKE 'unlicense%' OR file_name LIKE 'cc0%' OR file_name LIKE 'readme%'
+                OR file_name LIKE 'credits%' OR file_name LIKE 'attribution%' OR file_name LIKE 'notice%');
+            """;
+        cmd.Parameters.AddWithValue("$root", rootId);
+
+        var list = new List<DocCandidate>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+            list.Add(new DocCandidate(r.GetString(0), r.GetString(1), r.GetString(2)));
+        return list;
+    }
+
+    /// <summary>Replaces all detected license/readme rows of a root (user overrides live elsewhere and survive).</summary>
+    public async Task ReplaceFolderDocsAsync(long rootId, IEnumerable<FolderDocs> rows, CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+
+        await using (var delete = conn.CreateCommand())
+        {
+            delete.Transaction = tx;
+            delete.CommandText = "DELETE FROM folder_docs WHERE root_id = $root;";
+            delete.Parameters.AddWithValue("$root", rootId);
+            await delete.ExecuteNonQueryAsync(ct);
+        }
+
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO folder_docs
+                (root_id, folder, license_id, license_file, license_text, license_from_readme, readme_file, readme_text)
+            VALUES ($root, $folder, $lid, $lfile, $ltext, $lreadme, $rfile, $rtext);
+            """;
+        var pRoot = cmd.Parameters.Add("$root", SqliteType.Integer);
+        var pFolder = cmd.Parameters.Add("$folder", SqliteType.Text);
+        var pLid = cmd.Parameters.Add("$lid", SqliteType.Text);
+        var pLfile = cmd.Parameters.Add("$lfile", SqliteType.Text);
+        var pLtext = cmd.Parameters.Add("$ltext", SqliteType.Text);
+        var pLreadme = cmd.Parameters.Add("$lreadme", SqliteType.Integer);
+        var pRfile = cmd.Parameters.Add("$rfile", SqliteType.Text);
+        var pRtext = cmd.Parameters.Add("$rtext", SqliteType.Text);
+
+        foreach (var row in rows)
+        {
+            pRoot.Value = row.RootId;
+            pFolder.Value = row.Folder;
+            pLid.Value = (object?)row.LicenseId ?? DBNull.Value;
+            pLfile.Value = (object?)row.LicenseFile ?? DBNull.Value;
+            pLtext.Value = (object?)row.LicenseText ?? DBNull.Value;
+            pLreadme.Value = row.LicenseFromReadme ? 1 : 0;
+            pRfile.Value = (object?)row.ReadmeFile ?? DBNull.Value;
+            pRtext.Value = (object?)row.ReadmeText ?? DBNull.Value;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        await tx.CommitAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<FolderDocsSummary>> GetFolderDocSummariesAsync(CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT root_id, folder, license_id, license_file, license_from_readme, readme_file FROM folder_docs;";
+
+        var list = new List<FolderDocsSummary>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+            list.Add(new FolderDocsSummary(
+                r.GetInt64(0), r.GetString(1),
+                r.IsDBNull(2) ? null : r.GetString(2),
+                r.IsDBNull(3) ? null : r.GetString(3),
+                r.GetInt32(4) != 0,
+                r.IsDBNull(5) ? null : r.GetString(5)));
+        return list;
+    }
+
+    public async Task<FolderDocs?> GetFolderDocsAsync(long rootId, string folder, CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT license_id, license_file, license_text, license_from_readme, readme_file, readme_text
+            FROM folder_docs WHERE root_id = $root AND folder = $folder;
+            """;
+        cmd.Parameters.AddWithValue("$root", rootId);
+        cmd.Parameters.AddWithValue("$folder", folder);
+
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct)) return null;
+        return new FolderDocs(
+            rootId, folder,
+            r.IsDBNull(0) ? null : r.GetString(0),
+            r.IsDBNull(1) ? null : r.GetString(1),
+            r.IsDBNull(2) ? null : r.GetString(2),
+            r.GetInt32(3) != 0,
+            r.IsDBNull(4) ? null : r.GetString(4),
+            r.IsDBNull(5) ? null : r.GetString(5));
+    }
+
+    public async Task<IReadOnlyList<LicenseOverride>> GetLicenseOverridesAsync(CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT root_id, folder, license_id FROM license_overrides;";
+
+        var list = new List<LicenseOverride>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+            list.Add(new LicenseOverride(r.GetInt64(0), r.GetString(1), r.GetString(2)));
+        return list;
+    }
+
+    /// <summary>Assigns a license to a folder by hand; null removes the override (back to detection).</summary>
+    public async Task SetLicenseOverrideAsync(long rootId, string folder, string? licenseId, CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.Parameters.AddWithValue("$root", rootId);
+        cmd.Parameters.AddWithValue("$folder", folder);
+        if (licenseId is null)
+        {
+            cmd.CommandText = "DELETE FROM license_overrides WHERE root_id = $root AND folder = $folder;";
+        }
+        else
+        {
+            cmd.CommandText = """
+                INSERT INTO license_overrides (root_id, folder, license_id) VALUES ($root, $folder, $lid)
+                ON CONFLICT(root_id, folder) DO UPDATE SET license_id = excluded.license_id;
+                """;
+            cmd.Parameters.AddWithValue("$lid", licenseId);
+        }
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     public async Task SetHashAsync(long assetId, string hash, CancellationToken ct = default)
     {
         await using var conn = await _db.OpenAsync(ct);
@@ -358,7 +698,7 @@ public sealed class AssetRepository
     {
         var sql = new StringBuilder($"SELECT {Columns} FROM assets WHERE is_missing = 0");
         if (!string.IsNullOrWhiteSpace(query.Text))
-            sql.Append(" AND relative_path LIKE $text ESCAPE '\\'");
+            sql.Append(" AND (relative_path LIKE $text ESCAPE '\\' OR EXISTS (SELECT 1 FROM asset_tags xt JOIN tags tg ON tg.id = xt.tag_id WHERE xt.asset_id = assets.id AND tg.name LIKE $text ESCAPE '\\'))");
         if (query.Type is not null)
             sql.Append(" AND asset_type = $type");
         if (query.RootId is not null)
@@ -366,6 +706,14 @@ public sealed class AssetRepository
         var folder = query.Folder?.Trim('/');
         if (!string.IsNullOrEmpty(folder))
             sql.Append(" AND (directory = $folder OR directory LIKE $folderLike ESCAPE '\\')");
+        if (query.FavoritesOnly)
+            sql.Append(" AND is_favorite = 1");
+        if (query.OwnOnly)
+            sql.Append(" AND is_own = 1");
+        if (query.TagId is not null)
+            sql.Append(" AND EXISTS (SELECT 1 FROM asset_tags t1 WHERE t1.asset_id = assets.id AND t1.tag_id = $tagId)");
+        if (query.AnyTag)
+            sql.Append(" AND EXISTS (SELECT 1 FROM asset_tags t2 WHERE t2.asset_id = assets.id)");
         sql.Append(" ORDER BY file_name COLLATE NOCASE, id LIMIT $limit OFFSET $offset;");
 
         await using var conn = await _db.OpenAsync(ct);
@@ -387,6 +735,8 @@ public sealed class AssetRepository
             cmd.Parameters.AddWithValue("$folder", folder);
             cmd.Parameters.AddWithValue("$folderLike", EscapeLike(folder) + "/%"); // subfolders, but not "tex_old" for "tex"
         }
+        if (query.TagId is { } tagId)
+            cmd.Parameters.AddWithValue("$tagId", tagId);
         cmd.Parameters.AddWithValue("$limit", query.Limit);
         cmd.Parameters.AddWithValue("$offset", query.Offset);
 
@@ -443,5 +793,7 @@ public sealed class AssetRepository
         AddedUtc = DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(11)),
         IsMissing = r.GetInt32(12) != 0,
         Folder = r.GetString(13),
+        IsFavorite = r.GetInt32(14) != 0,
+        IsOwn = r.GetInt32(15) != 0,
     };
 }

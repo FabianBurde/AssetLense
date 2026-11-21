@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
+using AssetManager.App.Services;
 using AssetManager.Core.Models;
 using AssetManager.Core.Services;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -16,6 +17,7 @@ public sealed record TypeOption(string Label, AssetType? Type);
 public sealed partial class MainViewModel : ObservableObject, ISidebarActions
 {
     private readonly AssetLibrary _library;
+    private readonly ThemeService _theme;
     private CancellationTokenSource? _searchCts;
     private CancellationTokenSource? _syncCts;
     private SyncPhase _lastPhase = SyncPhase.Done;
@@ -23,11 +25,16 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
     private bool _suppressFolderSelection;
     private IReadOnlyList<AssetItemViewModel> _selectedAssets = Array.Empty<AssetItemViewModel>();
 
-    public MainViewModel(AssetLibrary library)
+    public MainViewModel(AssetLibrary library, ThemeService theme)
     {
         _library = library;
+        _theme = theme;
+        _isDarkMode = theme.IsDark;
         _selectedType = TypeOptions[0];
+        Inspector = new InspectorViewModel(library, message => StatusText = message, OnInspectorChangedAsync);
     }
+
+    public InspectorViewModel Inspector { get; }
 
     public IReadOnlyList<TypeOption> TypeOptions { get; } = new TypeOption[]
     {
@@ -53,11 +60,27 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
     [ObservableProperty] private bool _isProgressIndeterminate;
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ThemeToolTip))]
+    private bool _isDarkMode;
+
+    public string ThemeToolTip => IsDarkMode ? "Switch to light mode" : "Switch to dark mode";
+
+    [RelayCommand]
+    private void ToggleTheme()
+    {
+        _theme.Toggle();
+        IsDarkMode = _theme.IsDark;
+    }
+
+    [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(AddFolderCommand))]
     [NotifyCanExecuteChangedFor(nameof(RescanCommand))]
     private bool _isBusy;
 
     public bool HasSelection => _selectedAssets.Count > 0;
+
+    private bool IsSmartFilterActive =>
+        _selectedFolder?.Kind is NodeKind.Favorites or NodeKind.Own or NodeKind.Tag or NodeKind.TagGroup;
 
     partial void OnSearchTextChanged(string value) => _ = RefreshAsync();
     partial void OnSelectedTypeChanged(TypeOption value) => _ = RefreshAsync();
@@ -88,6 +111,8 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
         OpenSelectedCommand.NotifyCanExecuteChanged();
         foreach (var target in QuickTargets)
             target.RefreshCanCopy();
+
+        _ = Inspector.SetSelectionAsync(_selectedAssets);
     }
 
     private List<string> SelectedPaths() =>
@@ -96,6 +121,58 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
             .Where(p => p is not null && File.Exists(p))
             .Select(p => p!)
             .ToList();
+
+    // ---------------------------------------------------------------- inspector callbacks
+
+    private async Task OnInspectorChangedAsync(InspectorChange change)
+    {
+        switch (change)
+        {
+            case InspectorChange.License:
+                // Visible tiles re-read their license badge; off-screen tiles are lazy anyway.
+                foreach (var item in Items) item.InvalidateLicense();
+                break;
+
+            case InspectorChange.Flags:
+            case InspectorChange.Tags:
+                await ReloadSidebarAsync();
+                if (IsSmartFilterActive) await RefreshAsync();
+                break;
+        }
+    }
+
+    private void OnItemFlagsChanged()
+    {
+        Inspector.RefreshFlagTexts();
+        _ = OnInspectorChangedAsync(InspectorChange.Flags);
+    }
+
+    // ---------------------------------------------------------------- drag and drop
+
+    /// <summary>The files to hand to the drag operation (the whole selection), or null to cancel the drag.</summary>
+    public IReadOnlyList<string>? PrepareDrag()
+    {
+        if (_selectedAssets.Count > 1000)
+        {
+            var answer = MessageBox.Show(
+                $"Drag {_selectedAssets.Count:N0} files at once?", "Large drag",
+                MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (answer != MessageBoxResult.Yes) return null;
+        }
+
+        var paths = SelectedPaths();
+        if (paths.Count == 0)
+        {
+            StatusText = "The selected files are not available on disk.";
+            return null;
+        }
+        return paths;
+    }
+
+    public void OnDragFinished(int count, DragDropEffects effect) =>
+        StatusText = effect == DragDropEffects.None
+            ? "Drag cancelled"
+            : $"Dragged {count:N0} file(s). They were copied; your originals are untouched.";
 
     // ---------------------------------------------------------------- copy to clipboard / open
 
@@ -201,6 +278,21 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
 
         var model = target.Model;
         var plan = await _library.PlanCopyAsync(model, _selectedAssets.Select(a => a.Asset));
+        await RunCopyAsync(model, plan);
+    }
+
+    /// <summary>Copies files dropped onto a quick target from outside the app (e.g. from Explorer).</summary>
+    public async Task CopyFilesToTargetAsync(QuickTargetViewModel target, IEnumerable<string> paths)
+    {
+        if (IsBusy) return;
+
+        var model = target.Model;
+        var plan = await _library.PlanCopyFilesAsync(model, paths);
+        await RunCopyAsync(model, plan);
+    }
+
+    private async Task RunCopyAsync(QuickTarget model, IReadOnlyList<CopyPlanItem> plan)
+    {
         if (plan.Count == 0)
         {
             StatusText = "Nothing to copy (the files are missing on disk, or only Godot import files were selected).";
@@ -269,7 +361,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
         QuickTargets = targets.Select(t => new QuickTargetViewModel(t, this)).ToList();
     }
 
-    // ---------------------------------------------------------------- folders
+    // ---------------------------------------------------------------- sidebar
 
     public void OnFolderSelected(FolderNodeViewModel node)
     {
@@ -290,7 +382,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
 
         var answer = MessageBox.Show(
             $"Remove \"{root.Title}\" from the library?\n\n" +
-            "Your files on disk are not touched. Only the index (including tags) is deleted.",
+            "Your files on disk are not touched. Only the index (including tags and favorites) is deleted.",
             "Remove folder", MessageBoxButton.YesNo, MessageBoxImage.Question);
         if (answer != MessageBoxResult.Yes) return;
 
@@ -299,21 +391,52 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
         await RefreshAsync();
     }
 
+    /// <summary>Marks every asset in a folder (and below) as your own creation, or removes the mark.</summary>
+    public async Task MarkFolderOwnAsync(FolderNodeViewModel folder, bool value)
+    {
+        if (folder.RootId is null) return;
+
+        var count = await _library.SetOwnForFolderAsync(folder.RootId.Value, folder.Folder, value);
+        StatusText = value
+            ? $"Marked {count:N0} asset(s) in “{folder.Title}” as your own creations."
+            : $"Removed the “mine” mark from {count:N0} asset(s) in “{folder.Title}”.";
+
+        await ReloadSidebarAsync();
+        await RefreshAsync();
+    }
+
+    public async Task DeleteTagAsync(FolderNodeViewModel tag)
+    {
+        if (tag.TagId is null) return;
+
+        var answer = MessageBox.Show(
+            $"Delete the tag \"{tag.Title}\"?\n\nIt is removed from {tag.Count:N0} asset(s). The assets themselves are not changed.",
+            "Delete tag", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (answer != MessageBoxResult.Yes) return;
+
+        await _library.DeleteTagAsync(tag.TagId.Value);
+        await ReloadSidebarAsync();
+        await RefreshAsync();
+        _ = Inspector.SetSelectionAsync(_selectedAssets);
+    }
+
     private async Task ReloadSidebarAsync()
     {
         try
         {
-            RebuildFolders(await _library.GetFolderTreeAsync());
+            var data = await _library.GetSidebarAsync();
+            RebuildFolders(data);
+            Inspector.KnownTagNames = data.Tags.Select(t => t.Name).ToList();
             await ReloadTargetsAsync();
         }
         catch (Exception ex)
         {
-            StatusText = $"Could not load folders: {ex.Message}";
+            StatusText = $"Could not load the sidebar: {ex.Message}";
         }
     }
 
     /// <summary>Rebuilds the tree but keeps what is expanded and selected.</summary>
-    private void RebuildFolders(IReadOnlyList<FolderNode> nodes)
+    private void RebuildFolders(SidebarData data)
     {
         var previous = new Dictionary<string, FolderNodeViewModel>(StringComparer.OrdinalIgnoreCase);
         foreach (var n in Flatten(Folders)) previous[n.Key] = n;
@@ -322,9 +445,15 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
         _suppressFolderSelection = true;
         try
         {
-            var all = FolderNodeViewModel.CreateAll(nodes.Sum(n => n.Count), this);
-            var list = new List<FolderNodeViewModel> { all };
-            list.AddRange(nodes.Select(n => FolderNodeViewModel.Create(n, this)));
+            var all = FolderNodeViewModel.CreateSpecial(NodeKind.All, "All assets", data.Tree.Sum(n => n.Count), this);
+            var list = new List<FolderNodeViewModel>
+            {
+                all,
+                FolderNodeViewModel.CreateSpecial(NodeKind.Favorites, "★ Favorites", data.Counts.Favorites, this),
+                FolderNodeViewModel.CreateSpecial(NodeKind.Own, "My creations", data.Counts.Own, this),
+            };
+            list.AddRange(data.Tree.Select(n => FolderNodeViewModel.Create(n, this)));
+            list.Add(FolderNodeViewModel.CreateTagGroup(data.Counts.Tagged, data.Tags, this));
 
             FolderNodeViewModel? selected = null;
             foreach (var vm in Flatten(list))
@@ -336,7 +465,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
                     selected = vm;
             }
 
-            selected ??= all; // the selected folder disappeared (e.g. removed root)
+            selected ??= all; // the selected folder or tag disappeared
             selected.IsSelected = true;
             _selectedFolder = selected;
             Folders = list;
@@ -436,6 +565,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
 
         await ReloadSidebarAsync();
         await RefreshAsync();
+        foreach (var item in Items) item.InvalidateLicense(); // licenses may have been (re)detected
     }
 
     private void OnProgress(LibraryProgress p)
@@ -449,6 +579,10 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
             case SyncPhase.Hashing:
                 StatusText = p.Total > 0 ? $"Hashing… {p.Completed:N0} / {p.Total:N0}" : "Hashing…";
                 SetDeterminate(p);
+                break;
+            case SyncPhase.Licenses:
+                StatusText = "Reading licenses and readmes…";
+                IsProgressIndeterminate = true;
                 break;
             case SyncPhase.Thumbnails:
                 StatusText = p.Total > 0 ? $"Thumbnails… {p.Completed:N0} / {p.Total:N0}" : "Thumbnails…";
@@ -485,19 +619,24 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
         {
             await Task.Delay(150, cts.Token); // debounce while typing
 
+            var f = _selectedFolder;
             var assets = await _library.SearchAsync(new AssetQuery
             {
                 Text = SearchText,
                 Type = SelectedType.Type,
-                RootId = _selectedFolder?.RootId,
-                Folder = _selectedFolder?.Folder,
+                RootId = f?.Kind == NodeKind.Folder ? f.RootId : null,
+                Folder = f?.Kind == NodeKind.Folder ? f.Folder : null,
+                FavoritesOnly = f?.Kind == NodeKind.Favorites,
+                OwnOnly = f?.Kind == NodeKind.Own,
+                AnyTag = f?.Kind == NodeKind.TagGroup,
+                TagId = f?.Kind == NodeKind.Tag ? f.TagId : null,
                 Limit = 50_000,
             }, cts.Token);
 
             cts.Token.ThrowIfCancellationRequested();
 
             // One assignment = one UI update (much cheaper than adding thousands of items one by one).
-            Items = assets.Select(a => new AssetItemViewModel(a, _library)).ToList();
+            Items = assets.Select(a => new AssetItemViewModel(a, _library, OnItemFlagsChanged)).ToList();
             ResultCount = Items.Count;
         }
         catch (OperationCanceledException)

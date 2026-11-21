@@ -1,31 +1,83 @@
 using System.IO;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using AssetManager.Core.Licensing;
 using AssetManager.Core.Models;
 using AssetManager.Core.Services;
 using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
 
 namespace AssetManager.App.ViewModels;
 
 /// <summary>One tile in the grid. The thumbnail loads lazily, so only tiles that scroll into view cost anything.</summary>
-public sealed class AssetItemViewModel : ObservableObject
+public sealed partial class AssetItemViewModel : ObservableObject
 {
     private readonly Asset _asset;
     private readonly AssetLibrary _library;
+    private readonly Action _onFlagsChanged;
     private ImageSource? _thumbnail;
     private bool _thumbnailRequested;
+    private LicenseResolution? _license;
+    private bool _licenseResolved;
 
-    public AssetItemViewModel(Asset asset, AssetLibrary library)
+    public AssetItemViewModel(Asset asset, AssetLibrary library, Action onFlagsChanged)
     {
         _asset = asset;
         _library = library;
+        _onFlagsChanged = onFlagsChanged;
+        _isFavorite = asset.IsFavorite; // fields, so no change callbacks fire during setup
+        _isOwn = asset.IsOwn;
     }
 
+    public Asset Asset => _asset;
     public string FileName => _asset.FileName;
     public string RelativePath => _asset.RelativePath;
-    public Asset Asset => _asset;
     public string? FullPath => _library.GetFullPath(_asset);
     public string Extension => _asset.Extension.TrimStart('.').ToUpperInvariant();
+
+    [ObservableProperty] private bool _isFavorite;
+    [ObservableProperty] private bool _isOwn;
+
+    partial void OnIsOwnChanged(bool value) => InvalidateLicense();
+
+    [RelayCommand]
+    private async Task ToggleFavoriteAsync()
+    {
+        var value = !IsFavorite;
+        await _library.SetFavoriteAsync(new[] { _asset.Id }, value);
+        IsFavorite = value;
+        _onFlagsChanged();
+    }
+
+    // ---- license badge (resolved lazily, so off-screen tiles cost nothing) ----
+
+    private LicenseResolution? License
+    {
+        get
+        {
+            if (!_licenseResolved)
+            {
+                _license = IsOwn ? null : _library.ResolveLicense(_asset);
+                _licenseResolved = true;
+            }
+            return _license;
+        }
+    }
+
+    public string? LicenseBadgeText => License?.Info.ShortName;
+    public string LicenseRiskKey => License?.Info.Risk.ToString() ?? "None";
+    public string? LicenseTooltip => License is { } l ? $"{l.Info.Name}: {l.Info.Summary}" : null;
+
+    /// <summary>Call after licenses changed so visible tiles re-read their badge.</summary>
+    public void InvalidateLicense()
+    {
+        _licenseResolved = false;
+        OnPropertyChanged(nameof(LicenseBadgeText));
+        OnPropertyChanged(nameof(LicenseRiskKey));
+        OnPropertyChanged(nameof(LicenseTooltip));
+    }
+
+    // ---- details and thumbnail ----
 
     public string Details
     {

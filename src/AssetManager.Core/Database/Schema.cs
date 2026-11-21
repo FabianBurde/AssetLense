@@ -6,7 +6,7 @@ namespace AssetManager.Core.Database;
 /// </summary>
 internal static class Schema
 {
-    public static readonly IReadOnlyList<string> Migrations = new[] { V1, V2, V3 };
+    public static readonly IReadOnlyList<string> Migrations = new[] { V1, V2, V3, V4 };
 
     private const string V1 = """
         CREATE TABLE library_roots (
@@ -75,5 +75,32 @@ internal static class Schema
             sort_by_type INTEGER NOT NULL DEFAULT 0,
             snake_case   INTEGER NOT NULL DEFAULT 0
         );
+        """;
+
+    // Favorites, "my creations", and per-folder license/readme information.
+    private const string V4 = """
+        ALTER TABLE assets ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE assets ADD COLUMN is_own      INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX ix_assets_favorite ON assets(is_favorite) WHERE is_favorite = 1;
+        CREATE INDEX ix_assets_own      ON assets(is_own)      WHERE is_own = 1;
+
+        CREATE TABLE folder_docs (
+            root_id             INTEGER NOT NULL REFERENCES library_roots(id) ON DELETE CASCADE,
+            folder              TEXT    NOT NULL COLLATE NOCASE,
+            license_id          TEXT,
+            license_file        TEXT,
+            license_text        TEXT,
+            license_from_readme INTEGER NOT NULL DEFAULT 0,
+            readme_file         TEXT,
+            readme_text         TEXT,
+            PRIMARY KEY (root_id, folder)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE license_overrides (
+            root_id    INTEGER NOT NULL REFERENCES library_roots(id) ON DELETE CASCADE,
+            folder     TEXT    NOT NULL COLLATE NOCASE,
+            license_id TEXT    NOT NULL,
+            PRIMARY KEY (root_id, folder)
+        ) WITHOUT ROWID;
         """;
 }

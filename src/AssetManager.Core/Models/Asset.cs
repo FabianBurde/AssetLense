@@ -38,6 +38,11 @@ public sealed record Asset
     /// <summary>Set when a rescan no longer finds the file. Kept so tags survive a temporary drive disconnect.</summary>
     public bool IsMissing { get; init; }
 
+    public bool IsFavorite { get; init; }
+
+    /// <summary>Marked as the user's own creation (no third-party license applies).</summary>
+    public bool IsOwn { get; init; }
+
     public static Asset Create(long rootId, string relativePath, long sizeBytes, DateTimeOffset modifiedUtc)
     {
         var normalized = relativePath.Replace('\\', '/');

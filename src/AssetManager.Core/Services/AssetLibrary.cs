@@ -1,16 +1,19 @@
 using AssetManager.Core.Database;
 using AssetManager.Core.Hashing;
+using AssetManager.Core.Licensing;
 using AssetManager.Core.Models;
 using AssetManager.Core.Scanning;
 using AssetManager.Core.Thumbnails;
 
 namespace AssetManager.Core.Services;
 
-public enum SyncPhase { Scanning, Hashing, Thumbnails, Done }
+public enum SyncPhase { Scanning, Hashing, Licenses, Thumbnails, Done }
 
 /// <param name="Completed">Items processed in this phase.</param>
 /// <param name="Total">Items in this phase, or 0 if not known yet (scanning).</param>
 public sealed record LibraryProgress(SyncPhase Phase, int Completed, int Total);
+
+public sealed record SidebarData(IReadOnlyList<FolderNode> Tree, LibraryCounts Counts, IReadOnlyList<TagInfo> Tags);
 
 /// <summary>
 /// The one API the UI talks to. Everything here runs off the calling thread, because SQLite's
@@ -23,19 +26,22 @@ public sealed class AssetLibrary
     private readonly HashingService _hashing;
     private readonly ThumbnailService _thumbnails;
     private readonly ThumbnailCache _cache;
+    private readonly LicenseScanner _licenses;
 
     // Root id -> folder path, so tiles can resolve full file paths without a database hit.
     private volatile IReadOnlyDictionary<long, string> _rootPaths = new Dictionary<long, string>();
+    private volatile LicenseIndex _licenseIndex = LicenseIndex.Empty;
 
     public AssetLibrary(
         AssetRepository repo, FolderScanner scanner, HashingService hashing,
-        ThumbnailService thumbnails, ThumbnailCache cache)
+        ThumbnailService thumbnails, ThumbnailCache cache, LicenseScanner licenses)
     {
         _repo = repo;
         _scanner = scanner;
         _hashing = hashing;
         _thumbnails = thumbnails;
         _cache = cache;
+        _licenses = licenses;
     }
 
     /// <summary>Creates the default wiring (database, cache, Magick.NET) and applies migrations.</summary>
@@ -51,9 +57,11 @@ public sealed class AssetLibrary
             new FolderScanner(repo),
             new HashingService(repo),
             new ThumbnailService(repo, new MagickThumbnailGenerator(), cache),
-            cache);
+            cache,
+            new LicenseScanner(repo));
 
         await library.GetRootsAsync();
+        await library.RefreshLicensesAsync();
         return library;
     }
 
@@ -88,6 +96,65 @@ public sealed class AssetLibrary
             var counts = await _repo.GetDirectoryCountsAsync(ct);
             return FolderTreeBuilder.Build(roots, counts, r => Directory.Exists(r.Path));
         }, ct);
+
+    // ---- sidebar ----
+
+    /// <summary>Everything the sidebar shows: folder tree, favorite/own/tag counts, and the tag list.</summary>
+    public Task<SidebarData> GetSidebarAsync(CancellationToken ct = default) =>
+        Task.Run(async () =>
+        {
+            var roots = await _repo.GetRootsAsync(ct);
+            _rootPaths = roots.ToDictionary(r => r.Id, r => r.Path);
+            var counts = await _repo.GetDirectoryCountsAsync(ct);
+            var tree = FolderTreeBuilder.Build(roots, counts, r => Directory.Exists(r.Path));
+            return new SidebarData(tree, await _repo.GetFilterCountsAsync(ct), await _repo.GetTagsAsync(ct));
+        }, ct);
+
+    // ---- favorites, own work, tags ----
+
+    public Task SetFavoriteAsync(IReadOnlyList<long> ids, bool value, CancellationToken ct = default) =>
+        Task.Run(() => _repo.SetFavoriteAsync(ids, value, ct), ct);
+
+    public Task SetOwnAsync(IReadOnlyList<long> ids, bool value, CancellationToken ct = default) =>
+        Task.Run(() => _repo.SetOwnAsync(ids, value, ct), ct);
+
+    public Task<int> SetOwnForFolderAsync(long rootId, string folder, bool value, CancellationToken ct = default) =>
+        Task.Run(() => _repo.SetOwnForFolderAsync(rootId, folder, value, ct), ct);
+
+    public Task<IReadOnlyList<TagCount>> GetTagsForAssetsAsync(IReadOnlyList<long> ids, CancellationToken ct = default) =>
+        Task.Run(() => _repo.GetTagsForAssetsAsync(ids, ct), ct);
+
+    public Task AddTagsAsync(IReadOnlyList<long> ids, IEnumerable<string> names, CancellationToken ct = default) =>
+        Task.Run(() => _repo.AddTagsAsync(ids, names, ct), ct);
+
+    public Task RemoveTagAsync(IReadOnlyList<long> ids, string name, CancellationToken ct = default) =>
+        Task.Run(() => _repo.RemoveTagAsync(ids, name, ct), ct);
+
+    public Task DeleteTagAsync(long tagId, CancellationToken ct = default) =>
+        Task.Run(() => _repo.DeleteTagAsync(tagId, ct), ct);
+
+    // ---- licenses and readmes ----
+
+    public LicenseResolution? ResolveLicense(Asset asset) => _licenseIndex.ResolveLicense(asset.RootId, asset.Folder);
+
+    public ReadmeResolution? ResolveReadme(Asset asset) => _licenseIndex.ResolveReadme(asset.RootId, asset.Folder);
+
+    public Task<FolderDocs?> GetFolderDocsAsync(long rootId, string folder, CancellationToken ct = default) =>
+        Task.Run(() => _repo.GetFolderDocsAsync(rootId, folder, ct), ct);
+
+    public async Task SetLicenseOverrideAsync(long rootId, string folder, string? licenseId, CancellationToken ct = default)
+    {
+        await Task.Run(() => _repo.SetLicenseOverrideAsync(rootId, folder, licenseId, ct), ct);
+        await RefreshLicensesAsync(ct);
+    }
+
+    /// <summary>Reloads the in-memory license lookup from the database.</summary>
+    public async Task RefreshLicensesAsync(CancellationToken ct = default)
+    {
+        var (docs, overrides) = await Task.Run(async () =>
+            (await _repo.GetFolderDocSummariesAsync(ct), await _repo.GetLicenseOverridesAsync(ct)), ct);
+        _licenseIndex = new LicenseIndex(docs, overrides);
+    }
 
     // ---- assets ----
 
@@ -128,6 +195,16 @@ public sealed class AssetLibrary
         return Task.Run(() => CopyPlanner.Plan(target, sources));
     }
 
+    /// <summary>Plans a copy for plain files (e.g. dropped from Explorer); the type comes from the extension.</summary>
+    public Task<IReadOnlyList<CopyPlanItem>> PlanCopyFilesAsync(QuickTarget target, IEnumerable<string> paths)
+    {
+        var sources = paths
+            .Where(File.Exists)
+            .Select(p => new CopySource(p, AssetTypeDetector.Detect(Path.GetExtension(p))))
+            .ToList();
+        return Task.Run(() => CopyPlanner.Plan(target, sources));
+    }
+
     public Task<CopyResult> CopyAsync(
         IReadOnlyList<CopyPlanItem> plan, ConflictPolicy policy,
         IProgress<int>? progress = null, CancellationToken ct = default) =>
@@ -148,6 +225,10 @@ public sealed class AssetLibrary
             await _hashing.HashPendingAsync(rootId,
                 progress: new InlineProgress<HashProgress>(p => progress?.Report(new(SyncPhase.Hashing, p.Completed, p.Total))),
                 ct: ct);
+
+            progress?.Report(new(SyncPhase.Licenses, 0, 0));
+            await _licenses.ScanRootAsync(rootId, path, ct);
+            await RefreshLicensesAsync(ct);
 
             progress?.Report(new(SyncPhase.Thumbnails, 0, 0));
             await _thumbnails.GeneratePendingAsync(rootId,

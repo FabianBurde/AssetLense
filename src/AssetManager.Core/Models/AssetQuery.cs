@@ -15,6 +15,15 @@ public sealed record AssetQuery
     /// </summary>
     public string? Folder { get; init; }
 
+    public bool FavoritesOnly { get; init; }
+    public bool OwnOnly { get; init; }
+
+    /// <summary>Only assets that carry this tag.</summary>
+    public long? TagId { get; init; }
+
+    /// <summary>Only assets that carry at least one tag.</summary>
+    public bool AnyTag { get; init; }
+
     public int Limit { get; init; } = 200;
     public int Offset { get; init; } = 0;
 }

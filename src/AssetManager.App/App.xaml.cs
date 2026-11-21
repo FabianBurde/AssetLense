@@ -1,4 +1,5 @@
 using System.Windows;
+using AssetManager.App.Services;
 using AssetManager.App.ViewModels;
 using AssetManager.Core.Services;
 
@@ -12,10 +13,15 @@ public partial class App : Application
 
         try
         {
+            // Theme first, so the window (and any error dialog) opens in the right colors.
+            var theme = new ThemeService(AppSettings.Load());
+            theme.Initialize();
+
             var library = await AssetLibrary.OpenAsync();
-            var viewModel = new MainViewModel(library);
+            var viewModel = new MainViewModel(library, theme);
 
             var window = new MainWindow(viewModel);
+            theme.Attach(window);
             MainWindow = window;
             window.Show();
 

@@ -1,0 +1,21 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- Colors for our own elements (tiles, badges, inspector). Standard controls come from the Fluent theme. -->
+    <SolidColorBrush x:Key="Brush.TextMuted" Color="#777777"/>
+    <SolidColorBrush x:Key="Brush.TextFaint" Color="#888888"/>
+    <SolidColorBrush x:Key="Brush.PlaceholderText" Color="#999999"/>
+    <SolidColorBrush x:Key="Brush.Border" Color="#DDDDDD"/>
+    <SolidColorBrush x:Key="Brush.TileBackground" Color="#FAFAFA"/>
+    <SolidColorBrush x:Key="Brush.ThumbBackground" Color="#EEEEEE"/>
+    <SolidColorBrush x:Key="Brush.Chip" Color="#E3ECF8"/>
+    <SolidColorBrush x:Key="Brush.StarBackground" Color="#B3FFFFFF"/>
+    <SolidColorBrush x:Key="Brush.StarOff" Color="#666666"/>
+    <SolidColorBrush x:Key="Brush.BadgeNeutral" Color="#666666"/>
+    <SolidColorBrush x:Key="Brush.TextOk" Color="#2E7D32"/>
+    <SolidColorBrush x:Key="Brush.TextWarn" Color="#B26A00"/>
+    <SolidColorBrush x:Key="Brush.TextBad" Color="#C62828"/>
+    <SolidColorBrush x:Key="Brush.TextUnknown" Color="#666666"/>
+    <SolidColorBrush x:Key="Brush.DropHighlight" Color="#33007ACC"/>
+    <SolidColorBrush x:Key="Brush.WindowBackground" Color="#F3F3F3"/>
+    <SolidColorBrush x:Key="Brush.WindowText" Color="#1A1A1A"/>
+</ResourceDictionary>
