@@ -1,6 +1,6 @@
 namespace AssetManager.App.ViewModels;
 
-/// <summary>What sidebar items (folders, tags and quick targets) can ask the main view model to do.</summary>
+/// <summary>What sidebar items (folders, tags, bundles and quick targets) can ask the main view model to do.</summary>
 public interface ISidebarActions
 {
     bool HasSelection { get; }
@@ -11,6 +11,11 @@ public interface ISidebarActions
     Task MarkFolderOwnAsync(FolderNodeViewModel folder, bool value);
     Task DeleteTagAsync(FolderNodeViewModel tag);
     void OpenInExplorer(string? path);
+
+    Task NewBundleAsync();
+    Task RenameBundleAsync(FolderNodeViewModel bundle);
+    Task DeleteBundleAsync(FolderNodeViewModel bundle);
+    Task ExportBundleAsync(FolderNodeViewModel bundle);
 
     Task CopySelectionToAsync(QuickTargetViewModel target);
     Task UpdateTargetAsync(QuickTargetViewModel target);

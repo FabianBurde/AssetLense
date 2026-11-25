@@ -402,11 +402,13 @@ public sealed class AssetRepository
               (SELECT COUNT(*) FROM assets WHERE is_favorite = 1 AND is_missing = 0),
               (SELECT COUNT(*) FROM assets WHERE is_own = 1 AND is_missing = 0),
               (SELECT COUNT(DISTINCT xt.asset_id) FROM asset_tags xt
-                 JOIN assets a ON a.id = xt.asset_id WHERE a.is_missing = 0);
+                 JOIN assets a ON a.id = xt.asset_id WHERE a.is_missing = 0),
+              (SELECT COUNT(DISTINCT bx.asset_id) FROM bundle_assets bx
+                 JOIN assets b ON b.id = bx.asset_id WHERE b.is_missing = 0);
             """;
         await using var r = await cmd.ExecuteReaderAsync(ct);
         await r.ReadAsync(ct);
-        return new LibraryCounts(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2));
+        return new LibraryCounts(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3));
     }
 
     // ------------------------------------------------------------ tags
@@ -684,6 +686,123 @@ public sealed class AssetRepository
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    // ------------------------------------------------------------ bundles
+
+    public async Task<IReadOnlyList<BundleInfo>> GetBundlesAsync(CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT b.id, b.name, COUNT(a.id)
+            FROM bundles b
+            LEFT JOIN bundle_assets ba ON ba.bundle_id = b.id
+            LEFT JOIN assets a ON a.id = ba.asset_id AND a.is_missing = 0
+            GROUP BY b.id, b.name
+            ORDER BY b.name COLLATE NOCASE;
+            """;
+
+        var list = new List<BundleInfo>();
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+            list.Add(new BundleInfo(r.GetInt64(0), r.GetString(1), r.GetInt32(2)));
+        return list;
+    }
+
+    /// <summary>Creates a bundle, or returns the existing one with the same name.</summary>
+    public async Task<BundleInfo> CreateBundleAsync(string name, CancellationToken ct = default)
+    {
+        var clean = BundleNames.Normalize(name);
+        if (clean.Length == 0) throw new ArgumentException("A bundle needs a name.", nameof(name));
+
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO bundles (name, created_utc) VALUES ($name, $now)
+            ON CONFLICT(name) DO UPDATE SET name = excluded.name
+            RETURNING id;
+            """;
+        cmd.Parameters.AddWithValue("$name", clean);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        var id = Convert.ToInt64(await cmd.ExecuteScalarAsync(ct));
+        return new BundleInfo(id, clean, 0);
+    }
+
+    /// <summary>Returns false if another bundle already has that name.</summary>
+    public async Task<bool> RenameBundleAsync(long bundleId, string name, CancellationToken ct = default)
+    {
+        var clean = BundleNames.Normalize(name);
+        if (clean.Length == 0) return false;
+
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE bundles SET name = $name WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$name", clean);
+        cmd.Parameters.AddWithValue("$id", bundleId);
+        try
+        {
+            await cmd.ExecuteNonQueryAsync(ct);
+            return true;
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 19) // UNIQUE constraint
+        {
+            return false;
+        }
+    }
+
+    public async Task DeleteBundleAsync(long bundleId, CancellationToken ct = default)
+    {
+        await using var conn = await _db.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM bundles WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", bundleId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Adds assets to a bundle; returns how many were newly added (the rest were already in it).</summary>
+    public async Task<int> AddToBundleAsync(long bundleId, IReadOnlyList<long> assetIds, CancellationToken ct = default)
+    {
+        if (assetIds.Count == 0) return 0;
+
+        await using var conn = await _db.OpenAsync(ct);
+        await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "INSERT OR IGNORE INTO bundle_assets (bundle_id, asset_id) VALUES ($b, $a);";
+        cmd.Parameters.AddWithValue("$b", bundleId);
+        var pA = cmd.Parameters.Add("$a", SqliteType.Integer);
+
+        var added = 0;
+        foreach (var id in assetIds)
+        {
+            pA.Value = id;
+            added += await cmd.ExecuteNonQueryAsync(ct);
+        }
+        await tx.CommitAsync(ct);
+        return added;
+    }
+
+    public async Task<int> RemoveFromBundleAsync(long bundleId, IReadOnlyList<long> assetIds, CancellationToken ct = default)
+    {
+        if (assetIds.Count == 0) return 0;
+
+        await using var conn = await _db.OpenAsync(ct);
+        await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "DELETE FROM bundle_assets WHERE bundle_id = $b AND asset_id = $a;";
+        cmd.Parameters.AddWithValue("$b", bundleId);
+        var pA = cmd.Parameters.Add("$a", SqliteType.Integer);
+
+        var removed = 0;
+        foreach (var id in assetIds)
+        {
+            pA.Value = id;
+            removed += await cmd.ExecuteNonQueryAsync(ct);
+        }
+        await tx.CommitAsync(ct);
+        return removed;
+    }
+
     public async Task SetHashAsync(long assetId, string hash, CancellationToken ct = default)
     {
         await using var conn = await _db.OpenAsync(ct);
@@ -714,6 +833,10 @@ public sealed class AssetRepository
             sql.Append(" AND EXISTS (SELECT 1 FROM asset_tags t1 WHERE t1.asset_id = assets.id AND t1.tag_id = $tagId)");
         if (query.AnyTag)
             sql.Append(" AND EXISTS (SELECT 1 FROM asset_tags t2 WHERE t2.asset_id = assets.id)");
+        if (query.BundleId is not null)
+            sql.Append(" AND EXISTS (SELECT 1 FROM bundle_assets b1 WHERE b1.asset_id = assets.id AND b1.bundle_id = $bundleId)");
+        if (query.AnyBundle)
+            sql.Append(" AND EXISTS (SELECT 1 FROM bundle_assets b2 WHERE b2.asset_id = assets.id)");
         sql.Append(" ORDER BY file_name COLLATE NOCASE, id LIMIT $limit OFFSET $offset;");
 
         await using var conn = await _db.OpenAsync(ct);
@@ -737,6 +860,8 @@ public sealed class AssetRepository
         }
         if (query.TagId is { } tagId)
             cmd.Parameters.AddWithValue("$tagId", tagId);
+        if (query.BundleId is { } bundleId)
+            cmd.Parameters.AddWithValue("$bundleId", bundleId);
         cmd.Parameters.AddWithValue("$limit", query.Limit);
         cmd.Parameters.AddWithValue("$offset", query.Offset);
 

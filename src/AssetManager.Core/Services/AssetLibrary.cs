@@ -1,3 +1,4 @@
+using AssetManager.Core.Bundling;
 using AssetManager.Core.Database;
 using AssetManager.Core.Hashing;
 using AssetManager.Core.Licensing;
@@ -13,7 +14,7 @@ public enum SyncPhase { Scanning, Hashing, Licenses, Thumbnails, Done }
 /// <param name="Total">Items in this phase, or 0 if not known yet (scanning).</param>
 public sealed record LibraryProgress(SyncPhase Phase, int Completed, int Total);
 
-public sealed record SidebarData(IReadOnlyList<FolderNode> Tree, LibraryCounts Counts, IReadOnlyList<TagInfo> Tags);
+public sealed record SidebarData(IReadOnlyList<FolderNode> Tree, LibraryCounts Counts, IReadOnlyList<TagInfo> Tags, IReadOnlyList<BundleInfo> Bundles);
 
 /// <summary>
 /// The one API the UI talks to. Everything here runs off the calling thread, because SQLite's
@@ -29,7 +30,7 @@ public sealed class AssetLibrary
     private readonly LicenseScanner _licenses;
 
     // Root id -> folder path, so tiles can resolve full file paths without a database hit.
-    private volatile IReadOnlyDictionary<long, string> _rootPaths = new Dictionary<long, string>();
+    private volatile IReadOnlyDictionary<long, LibraryRoot> _roots = new Dictionary<long, LibraryRoot>();
     private volatile LicenseIndex _licenseIndex = LicenseIndex.Empty;
 
     public AssetLibrary(
@@ -83,7 +84,7 @@ public sealed class AssetLibrary
     public async Task<IReadOnlyList<LibraryRoot>> GetRootsAsync(CancellationToken ct = default)
     {
         var roots = await Task.Run(() => _repo.GetRootsAsync(ct), ct);
-        _rootPaths = roots.ToDictionary(r => r.Id, r => r.Path);
+        _roots = roots.ToDictionary(r => r.Id);
         return roots;
     }
 
@@ -92,7 +93,7 @@ public sealed class AssetLibrary
         Task.Run(async () =>
         {
             var roots = await _repo.GetRootsAsync(ct);
-            _rootPaths = roots.ToDictionary(r => r.Id, r => r.Path);
+            _roots = roots.ToDictionary(r => r.Id);
             var counts = await _repo.GetDirectoryCountsAsync(ct);
             return FolderTreeBuilder.Build(roots, counts, r => Directory.Exists(r.Path));
         }, ct);
@@ -104,10 +105,10 @@ public sealed class AssetLibrary
         Task.Run(async () =>
         {
             var roots = await _repo.GetRootsAsync(ct);
-            _rootPaths = roots.ToDictionary(r => r.Id, r => r.Path);
+            _roots = roots.ToDictionary(r => r.Id);
             var counts = await _repo.GetDirectoryCountsAsync(ct);
             var tree = FolderTreeBuilder.Build(roots, counts, r => Directory.Exists(r.Path));
-            return new SidebarData(tree, await _repo.GetFilterCountsAsync(ct), await _repo.GetTagsAsync(ct));
+            return new SidebarData(tree, await _repo.GetFilterCountsAsync(ct), await _repo.GetTagsAsync(ct), await _repo.GetBundlesAsync(ct));
         }, ct);
 
     // ---- favorites, own work, tags ----
@@ -132,6 +133,52 @@ public sealed class AssetLibrary
 
     public Task DeleteTagAsync(long tagId, CancellationToken ct = default) =>
         Task.Run(() => _repo.DeleteTagAsync(tagId, ct), ct);
+
+    // ---- bundles ----
+
+    public Task<BundleInfo> CreateBundleAsync(string name, CancellationToken ct = default) =>
+        Task.Run(() => _repo.CreateBundleAsync(name, ct), ct);
+
+    public Task<bool> RenameBundleAsync(long bundleId, string name, CancellationToken ct = default) =>
+        Task.Run(() => _repo.RenameBundleAsync(bundleId, name, ct), ct);
+
+    public Task DeleteBundleAsync(long bundleId, CancellationToken ct = default) =>
+        Task.Run(() => _repo.DeleteBundleAsync(bundleId, ct), ct);
+
+    public Task<int> AddToBundleAsync(long bundleId, IReadOnlyList<long> assetIds, CancellationToken ct = default) =>
+        Task.Run(() => _repo.AddToBundleAsync(bundleId, assetIds, ct), ct);
+
+    public Task<int> RemoveFromBundleAsync(long bundleId, IReadOnlyList<long> assetIds, CancellationToken ct = default) =>
+        Task.Run(() => _repo.RemoveFromBundleAsync(bundleId, assetIds, ct), ct);
+
+    /// <summary>Assets that may not be safe to share: no license, a restricted one, or one we couldn't identify.</summary>
+    public LicenseReport AnalyzeLicenses(IEnumerable<Asset> assets) =>
+        BundleLicenseCheck.Analyze(BuildExportItems(assets));
+
+    /// <summary>Writes the assets into a zip file (see <see cref="BundleExporter"/> for the details).</summary>
+    public Task<BundleExportResult> ExportZipAsync(
+        IEnumerable<Asset> assets, string destinationPath, BundleExportOptions options,
+        IProgress<ExportProgress>? progress = null, CancellationToken ct = default)
+    {
+        var items = BuildExportItems(assets);
+        return BundleExporter.ExportAsync(items, destinationPath, options, progress, ct);
+    }
+
+    private IReadOnlyList<ExportItem> BuildExportItems(IEnumerable<Asset> assets)
+    {
+        var list = new List<ExportItem>();
+        foreach (var asset in assets)
+        {
+            if (!_roots.TryGetValue(asset.RootId, out var root)) continue;
+
+            var full = Path.Combine(root.Path, asset.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+            list.Add(new ExportItem(
+                asset, root.DisplayName, root.Path, full,
+                asset.IsOwn ? null : _licenseIndex.ResolveLicense(asset.RootId, asset.Folder),
+                _licenseIndex.ResolveReadme(asset.RootId, asset.Folder)));
+        }
+        return list;
+    }
 
     // ---- licenses and readmes ----
 
@@ -163,8 +210,8 @@ public sealed class AssetLibrary
 
     /// <summary>Full path of the file on disk, or null if its root is unknown.</summary>
     public string? GetFullPath(Asset asset) =>
-        _rootPaths.TryGetValue(asset.RootId, out var root)
-            ? Path.Combine(root, asset.RelativePath.Replace('/', Path.DirectorySeparatorChar))
+        _roots.TryGetValue(asset.RootId, out var root)
+            ? Path.Combine(root.Path, asset.RelativePath.Replace('/', Path.DirectorySeparatorChar))
             : null;
 
     /// <summary>Path of the cached thumbnail, or null if there isn't one (yet).</summary>

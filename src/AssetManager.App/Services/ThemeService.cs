@@ -16,7 +16,14 @@ public sealed class ThemeService
     private readonly AppSettings _settings;
     private readonly List<Window> _windows = new();
 
-    public ThemeService(AppSettings settings) => _settings = settings;
+    public ThemeService(AppSettings settings)
+    {
+        _settings = settings;
+        Current = this;
+    }
+
+    /// <summary>The running instance, so dialogs can register themselves for title bar updates.</summary>
+    public static ThemeService? Current { get; private set; }
 
     public bool IsDark { get; private set; }
 
@@ -34,6 +41,7 @@ public sealed class ThemeService
     public void Attach(Window window)
     {
         _windows.Add(window);
+        window.Closed += (_, _) => _windows.Remove(window);
         window.SourceInitialized += (_, _) => SetDarkTitleBar(window, IsDark);
         SetDarkTitleBar(window, IsDark); // no-op until the window has a handle
     }

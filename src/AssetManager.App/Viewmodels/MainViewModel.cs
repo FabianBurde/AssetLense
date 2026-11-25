@@ -4,6 +4,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
 using AssetManager.App.Services;
+using AssetManager.App.Views;
+using AssetManager.Core.Bundling;
 using AssetManager.Core.Models;
 using AssetManager.Core.Services;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -80,7 +82,8 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
     public bool HasSelection => _selectedAssets.Count > 0;
 
     private bool IsSmartFilterActive =>
-        _selectedFolder?.Kind is NodeKind.Favorites or NodeKind.Own or NodeKind.Tag or NodeKind.TagGroup;
+        _selectedFolder?.Kind is NodeKind.Favorites or NodeKind.Own or NodeKind.Tag or NodeKind.TagGroup
+            or NodeKind.Bundle or NodeKind.BundleGroup;
 
     partial void OnSearchTextChanged(string value) => _ = RefreshAsync();
     partial void OnSelectedTypeChanged(TypeOption value) => _ = RefreshAsync();
@@ -109,6 +112,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
         CopyPathsCommand.NotifyCanExecuteChanged();
         ShowInExplorerCommand.NotifyCanExecuteChanged();
         OpenSelectedCommand.NotifyCanExecuteChanged();
+        ExportSelectionCommand.NotifyCanExecuteChanged();
         foreach (var target in QuickTargets)
             target.RefreshCanCopy();
 
@@ -367,6 +371,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
     {
         if (_suppressFolderSelection) return;
         _selectedFolder = node;
+        IsBundleSelected = node.Kind == NodeKind.Bundle;
         _ = RefreshAsync();
     }
 
@@ -427,6 +432,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
             var data = await _library.GetSidebarAsync();
             RebuildFolders(data);
             Inspector.KnownTagNames = data.Tags.Select(t => t.Name).ToList();
+            BuildBundleMenu(data.Bundles);
             await ReloadTargetsAsync();
         }
         catch (Exception ex)
@@ -454,6 +460,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
             };
             list.AddRange(data.Tree.Select(n => FolderNodeViewModel.Create(n, this)));
             list.Add(FolderNodeViewModel.CreateTagGroup(data.Counts.Tagged, data.Tags, this));
+            list.Add(FolderNodeViewModel.CreateBundleGroup(data.Counts.Bundled, data.Bundles, this));
 
             FolderNodeViewModel? selected = null;
             foreach (var vm in Flatten(list))
@@ -468,6 +475,7 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
             selected ??= all; // the selected folder or tag disappeared
             selected.IsSelected = true;
             _selectedFolder = selected;
+            IsBundleSelected = selected.Kind == NodeKind.Bundle;
             Folders = list;
         }
         finally
@@ -484,6 +492,205 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
             foreach (var child in Flatten(node.Children))
                 yield return child;
         }
+    }
+
+    // ---------------------------------------------------------------- bundles
+
+    [ObservableProperty] private IReadOnlyList<BundleMenuItem> _bundleMenuItems = Array.Empty<BundleMenuItem>();
+    [ObservableProperty] private bool _isBundleSelected;
+
+    private void BuildBundleMenu(IReadOnlyList<BundleInfo> bundles)
+    {
+        var items = bundles
+            .Select(b => new BundleMenuItem(b.Name, new AsyncRelayCommand(() => AddSelectionToBundleAsync(b.Id, b.Name))))
+            .ToList();
+        items.Add(new BundleMenuItem("New bundle…", new AsyncRelayCommand(AddSelectionToNewBundleAsync)));
+        BundleMenuItems = items;
+    }
+
+    private static string? AskForName(string title, string label, string initial) =>
+        PromptWindow.Ask(Application.Current.MainWindow, title, label, initial);
+
+    public async Task NewBundleAsync()
+    {
+        var name = AskForName("New bundle", "Bundle name", "");
+        if (name is null) return;
+
+        var bundle = await _library.CreateBundleAsync(name);
+        StatusText = $"Bundle “{bundle.Name}” created. Drag assets onto it or use right-click, Add to bundle.";
+        await ReloadSidebarAsync();
+    }
+
+    public async Task RenameBundleAsync(FolderNodeViewModel bundle)
+    {
+        if (bundle.BundleId is null) return;
+        var name = AskForName("Rename bundle", "Bundle name", bundle.Title);
+        if (name is null) return;
+
+        if (!await _library.RenameBundleAsync(bundle.BundleId.Value, name))
+        {
+            MessageBox.Show("A bundle with that name already exists.", "Rename bundle",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        await ReloadSidebarAsync();
+    }
+
+    public async Task DeleteBundleAsync(FolderNodeViewModel bundle)
+    {
+        if (bundle.BundleId is null) return;
+
+        var answer = MessageBox.Show(
+            $"Delete the bundle \"{bundle.Title}\"?\n\nOnly the list is deleted. The assets and your files stay as they are.",
+            "Delete bundle", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (answer != MessageBoxResult.Yes) return;
+
+        await _library.DeleteBundleAsync(bundle.BundleId.Value);
+        await ReloadSidebarAsync();
+        await RefreshAsync();
+    }
+
+    private async Task AddSelectionToNewBundleAsync()
+    {
+        if (!HasSelection) return;
+        var name = AskForName("New bundle", "Bundle name", "");
+        if (name is null) return;
+
+        var bundle = await _library.CreateBundleAsync(name);
+        await AddSelectionToBundleAsync(bundle.Id, bundle.Name);
+    }
+
+    /// <summary>Adds the selected assets to a bundle (right-click menu, or dropped onto the bundle in the sidebar).</summary>
+    public async Task AddSelectionToBundleAsync(long bundleId, string bundleName)
+    {
+        if (!HasSelection) return;
+
+        var ids = _selectedAssets.Select(a => a.Asset.Id).ToList();
+        var added = await _library.AddToBundleAsync(bundleId, ids);
+        StatusText = added == ids.Count
+            ? $"Added {added:N0} asset(s) to “{bundleName}”."
+            : $"Added {added:N0} asset(s) to “{bundleName}” ({ids.Count - added:N0} already in it).";
+
+        await ReloadSidebarAsync();
+        if (_selectedFolder?.Kind is NodeKind.Bundle or NodeKind.BundleGroup)
+            await RefreshAsync();
+    }
+
+    [RelayCommand]
+    private async Task RemoveFromBundleAsync()
+    {
+        var folder = _selectedFolder;
+        if (folder is null || folder.Kind != NodeKind.Bundle || folder.BundleId is null || !HasSelection) return;
+
+        var ids = _selectedAssets.Select(a => a.Asset.Id).ToList();
+        var removed = await _library.RemoveFromBundleAsync(folder.BundleId.Value, ids);
+        StatusText = $"Removed {removed:N0} asset(s) from “{folder.Title}”.";
+
+        await ReloadSidebarAsync();
+        await RefreshAsync();
+    }
+
+    public async Task ExportBundleAsync(FolderNodeViewModel bundle)
+    {
+        if (bundle.BundleId is null || IsBusy) return;
+
+        var assets = await _library.SearchAsync(new AssetQuery { BundleId = bundle.BundleId, Limit = 200_000 });
+        await RunExportAsync(bundle.Title, assets);
+    }
+
+    [RelayCommand(CanExecute = nameof(HasSelection))]
+    private async Task ExportSelectionAsync()
+    {
+        if (IsBusy) return;
+
+        // The tiles hold the live favorite/own flags; the Asset records are snapshots from the last search.
+        var assets = _selectedAssets
+            .Select(a => a.Asset with { IsOwn = a.IsOwn, IsFavorite = a.IsFavorite })
+            .ToList();
+        await RunExportAsync("selection", assets);
+    }
+
+    private async Task RunExportAsync(string suggestedName, IReadOnlyList<Asset> assets)
+    {
+        if (IsBusy) return;
+        if (assets.Count == 0)
+        {
+            StatusText = "Nothing to export.";
+            return;
+        }
+
+        var report = _library.AnalyzeLicenses(assets);
+        var dialog = new ExportOptionsWindow(suggestedName, assets.Count, report)
+        {
+            Owner = Application.Current.MainWindow,
+        };
+        if (dialog.ShowDialog() != true) return;
+
+        var save = new SaveFileDialog
+        {
+            Title = "Export as zip",
+            Filter = "Zip archive (*.zip)|*.zip",
+            DefaultExt = ".zip",
+            AddExtension = true,
+            OverwritePrompt = true,
+            FileName = SafeFileName(suggestedName) + ".zip",
+        };
+        if (save.ShowDialog() != true) return;
+
+        _syncCts = new CancellationTokenSource();
+        IsBusy = true;
+        IsProgressIndeterminate = false;
+        ProgressValue = 0;
+        try
+        {
+            var progress = new Progress<ExportProgress>(p =>
+            {
+                StatusText = $"Exporting… {p.Done:N0} / {p.Total:N0}";
+                ProgressValue = p.Total == 0 ? 0 : 100.0 * p.Done / p.Total;
+            });
+            var result = await _library.ExportZipAsync(assets, save.FileName, dialog.Options, progress, _syncCts.Token);
+            StatusText = DescribeExport(result);
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText = "Export cancelled";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            StatusText = $"Export failed: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private static string DescribeExport(BundleExportResult r)
+    {
+        var text = $"Exported {r.Files:N0} file(s) to {Path.GetFileName(r.Path)} ({FormatBytes(r.ArchiveBytes)})";
+        if (r.Skipped.Count > 0)
+            text += $". {r.Skipped.Count:N0} missing file(s) were skipped";
+        return text + ".";
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB" };
+        double value = bytes;
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+        return unit == 0 ? $"{bytes} B" : $"{value:0.#} {units[unit]}";
+    }
+
+    private static string SafeFileName(string name)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var cleaned = new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray()).Trim();
+        return cleaned.Length == 0 ? "bundle" : cleaned;
     }
 
     // ---------------------------------------------------------------- scanning
@@ -630,6 +837,8 @@ public sealed partial class MainViewModel : ObservableObject, ISidebarActions
                 OwnOnly = f?.Kind == NodeKind.Own,
                 AnyTag = f?.Kind == NodeKind.TagGroup,
                 TagId = f?.Kind == NodeKind.Tag ? f.TagId : null,
+                BundleId = f?.Kind == NodeKind.Bundle ? f.BundleId : null,
+                AnyBundle = f?.Kind == NodeKind.BundleGroup,
                 Limit = 50_000,
             }, cts.Token);
 

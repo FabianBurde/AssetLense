@@ -4,9 +4,9 @@ using CommunityToolkit.Mvvm.Input;
 
 namespace AssetManager.App.ViewModels;
 
-public enum NodeKind { All, Favorites, Own, TagGroup, Tag, Folder }
+public enum NodeKind { All, Favorites, Own, TagGroup, Tag, BundleGroup, Bundle, Folder }
 
-/// <summary>One row in the sidebar tree: a smart filter, a tag, a library root, or a folder inside a root.</summary>
+/// <summary>One row in the sidebar tree: a smart filter, a tag, a bundle, a library root, or a folder inside a root.</summary>
 public sealed partial class FolderNodeViewModel : ObservableObject
 {
     public const string AllKey = "all";
@@ -17,7 +17,7 @@ public sealed partial class FolderNodeViewModel : ObservableObject
         ISidebarActions actions, NodeKind kind, string title, int count,
         IReadOnlyList<FolderNodeViewModel> children,
         long? rootId = null, string folder = "", string? fullPath = null, bool isRoot = false,
-        bool isOffline = false, long? tagId = null)
+        bool isOffline = false, long? tagId = null, long? bundleId = null)
     {
         _actions = actions;
         Kind = kind;
@@ -30,6 +30,7 @@ public sealed partial class FolderNodeViewModel : ObservableObject
         IsRoot = isRoot;
         IsOffline = isOffline;
         TagId = tagId;
+        BundleId = bundleId;
     }
 
     public static FolderNodeViewModel CreateSpecial(NodeKind kind, string title, int count, ISidebarActions actions) =>
@@ -42,6 +43,15 @@ public sealed partial class FolderNodeViewModel : ObservableObject
                 Array.Empty<FolderNodeViewModel>(), tagId: t.Id))
             .ToList();
         return new FolderNodeViewModel(actions, NodeKind.TagGroup, "Tags", taggedCount, children) { IsExpanded = true };
+    }
+
+    public static FolderNodeViewModel CreateBundleGroup(int bundledCount, IReadOnlyList<BundleInfo> bundles, ISidebarActions actions)
+    {
+        var children = bundles
+            .Select(b => new FolderNodeViewModel(actions, NodeKind.Bundle, b.Name, b.Count,
+                Array.Empty<FolderNodeViewModel>(), bundleId: b.Id))
+            .ToList();
+        return new FolderNodeViewModel(actions, NodeKind.BundleGroup, "Bundles", bundledCount, children) { IsExpanded = true };
     }
 
     public static FolderNodeViewModel Create(FolderNode node, ISidebarActions actions)
@@ -58,6 +68,7 @@ public sealed partial class FolderNodeViewModel : ObservableObject
     public NodeKind Kind { get; }
     public long? RootId { get; }
     public long? TagId { get; }
+    public long? BundleId { get; }
     public string Title { get; }
 
     /// <summary>Relative to the root, '/' separated; empty for the root itself.</summary>
@@ -70,7 +81,9 @@ public sealed partial class FolderNodeViewModel : ObservableObject
 
     public bool IsFolderKind => Kind == NodeKind.Folder;
     public bool IsTagKind => Kind == NodeKind.Tag;
-    public bool HasMenu => Kind is NodeKind.Folder or NodeKind.Tag;
+    public bool IsBundleKind => Kind == NodeKind.Bundle;
+    public bool IsBundleGroupKind => Kind == NodeKind.BundleGroup;
+    public bool HasMenu => Kind is NodeKind.Folder or NodeKind.Tag or NodeKind.Bundle or NodeKind.BundleGroup;
 
     public string DisplayText => IsOffline ? $"{Title} (offline)" : Title;
 
@@ -81,6 +94,8 @@ public sealed partial class FolderNodeViewModel : ObservableObject
         NodeKind.Own => "own",
         NodeKind.TagGroup => "tags",
         NodeKind.Tag => $"tag:{TagId}",
+        NodeKind.BundleGroup => "bundles",
+        NodeKind.Bundle => $"bundle:{BundleId}",
         _ => $"{RootId}:{Folder}",
     };
 
@@ -113,4 +128,16 @@ public sealed partial class FolderNodeViewModel : ObservableObject
 
     [RelayCommand(CanExecute = nameof(IsTagKind))]
     private Task DeleteTagAsync() => _actions.DeleteTagAsync(this);
+
+    [RelayCommand(CanExecute = nameof(IsBundleGroupKind))]
+    private Task NewBundleAsync() => _actions.NewBundleAsync();
+
+    [RelayCommand(CanExecute = nameof(IsBundleKind))]
+    private Task RenameBundleAsync() => _actions.RenameBundleAsync(this);
+
+    [RelayCommand(CanExecute = nameof(IsBundleKind))]
+    private Task DeleteBundleAsync() => _actions.DeleteBundleAsync(this);
+
+    [RelayCommand(CanExecute = nameof(IsBundleKind))]
+    private Task ExportBundleAsync() => _actions.ExportBundleAsync(this);
 }

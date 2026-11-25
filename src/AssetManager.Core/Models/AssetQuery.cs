@@ -24,6 +24,12 @@ public sealed record AssetQuery
     /// <summary>Only assets that carry at least one tag.</summary>
     public bool AnyTag { get; init; }
 
+    /// <summary>Only assets that are in this bundle.</summary>
+    public long? BundleId { get; init; }
+
+    /// <summary>Only assets that are in at least one bundle.</summary>
+    public bool AnyBundle { get; init; }
+
     public int Limit { get; init; } = 200;
     public int Offset { get; init; } = 0;
 }

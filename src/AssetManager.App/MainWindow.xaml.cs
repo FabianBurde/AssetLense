@@ -160,6 +160,54 @@ public partial class MainWindow : Window
         }), DispatcherPriority.Background);
     }
 
+    // ---------------------------------------------------------------- dropping tiles onto a bundle in the sidebar
+
+    private static bool IsBundleDrop(object sender, DragEventArgs e) =>
+        e.Data.GetDataPresent(InternalDragFormat) &&
+        sender is FrameworkElement { DataContext: FolderNodeViewModel { Kind: NodeKind.Bundle } };
+
+    // Anything else (like folders dragged in from Explorer) is left alone and handled by the tree itself.
+    private void Node_DragEnter(object sender, DragEventArgs e)
+    {
+        if (IsBundleDrop(sender, e) && sender is Panel panel)
+            panel.Background = (Brush)FindResource("Brush.DropHighlight");
+    }
+
+    private void Node_DragOver(object sender, DragEventArgs e)
+    {
+        if (!IsBundleDrop(sender, e)) return;
+        e.Effects = DragDropEffects.Copy;
+        e.Handled = true;
+    }
+
+    private void Node_DragLeave(object sender, DragEventArgs e)
+    {
+        if (sender is Panel panel) panel.Background = Brushes.Transparent;
+    }
+
+    private void Node_Drop(object sender, DragEventArgs e)
+    {
+        if (sender is Panel panel) panel.Background = Brushes.Transparent;
+        if (!IsBundleDrop(sender, e)) return;
+
+        var node = (FolderNodeViewModel)((FrameworkElement)sender).DataContext;
+        var bundleId = node.BundleId!.Value; // IsBundleDrop guarantees this is a bundle node
+        e.Handled = true;
+        var name = node.Title;
+
+        Dispatcher.BeginInvoke(new Action(async () =>
+        {
+            try
+            {
+                await ViewModel.AddSelectionToBundleAsync(bundleId, name);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message, "Could not add to the bundle", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }), DispatcherPriority.Background);
+    }
+
     // ---------------------------------------------------------------- dropping folders onto the sidebar
 
     private void Folders_DragOver(object sender, DragEventArgs e)

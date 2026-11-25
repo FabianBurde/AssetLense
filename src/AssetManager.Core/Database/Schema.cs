@@ -6,7 +6,7 @@ namespace AssetManager.Core.Database;
 /// </summary>
 internal static class Schema
 {
-    public static readonly IReadOnlyList<string> Migrations = new[] { V1, V2, V3, V4 };
+    public static readonly IReadOnlyList<string> Migrations = new[] { V1, V2, V3, V4, V5 };
 
     private const string V1 = """
         CREATE TABLE library_roots (
@@ -102,5 +102,22 @@ internal static class Schema
             license_id TEXT    NOT NULL,
             PRIMARY KEY (root_id, folder)
         ) WITHOUT ROWID;
+        """;
+
+    // Bundles: named lists of assets that can be exported as a zip.
+    private const string V5 = """
+        CREATE TABLE bundles (
+            id          INTEGER PRIMARY KEY,
+            name        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+            created_utc INTEGER NOT NULL
+        );
+
+        CREATE TABLE bundle_assets (
+            bundle_id INTEGER NOT NULL REFERENCES bundles(id) ON DELETE CASCADE,
+            asset_id  INTEGER NOT NULL REFERENCES assets(id)  ON DELETE CASCADE,
+            PRIMARY KEY (bundle_id, asset_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX ix_bundle_assets_asset ON bundle_assets(asset_id);
         """;
 }
